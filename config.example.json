@@ -1,0 +1,8 @@
+{
+  "corpus_root": "/volume1/documents",
+  "publish_dir": "/volume1/documents/_aplidocs",
+  "prune_dirs": ["private", "personal"],
+  "metadata_only_globs": ["archive/duplicates/*", "reports/generated_index.csv"],
+  "filename_pattern": "^(?P<year>\\d{4})-(?P<department>[A-Z]{2,4})-(?P<doc_id>\\d+)\\b",
+  "smoke_term": "invoice"
+}

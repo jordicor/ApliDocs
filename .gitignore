@@ -1,0 +1,4 @@
+build/
+*.sqlite
+config.json
+__pycache__/

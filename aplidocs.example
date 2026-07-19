@@ -1,0 +1,24 @@
+#!/bin/sh
+# ApliDocs CLI wrapper.
+#
+# Install:  copy this file to ~/bin/aplidocs, then `chmod 755 ~/bin/aplidocs`.
+# Agents must call it by FULL PATH (~/bin is NOT on the PATH for non-interactive
+# SSH sessions -- see docs/SYNOLOGY.md), e.g.
+#     /var/services/homes/YOURUSER/bin/aplidocs status
+#
+# Edit the three absolute paths below to match your install:
+#   VENV_PY  the venv Python that has FTS5 (pysqlite3-binary installed)
+#   CLI      aplidocs_cli.py
+#   DB       the published aplidocs-index.sqlite (inside publish_dir)
+#
+# Passing --db here makes DB discovery explicit and layout-independent. If you
+# instead drop a copy of aplidocs_cli.py in <publish_dir>/cli/, the CLI finds
+# the database on its own and you can remove the --db argument.
+#
+# -B keeps Python from writing .pyc files next to the CLI.
+
+VENV_PY="$HOME/apps/venv/bin/python"
+CLI="$HOME/apps/aplidocs/aplidocs_cli.py"
+DB="/volume1/documents/_aplidocs/aplidocs-index.sqlite"
+
+exec "$VENV_PY" -B "$CLI" --db "$DB" "$@"

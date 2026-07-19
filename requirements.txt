@@ -1,0 +1,9 @@
+# ApliDocs runs on Python 3.8+ using only the standard library, plus the
+# external command `pdftotext` (poppler/xpdf) on PATH for PDF text extraction.
+#
+# The single dependency below is ONLY needed when your Python's built-in
+# sqlite3 module was not compiled with a usable FTS5 extension. Synology DSM
+# 7.x ships Python 3.8 whose bundled sqlite3 lacks FTS5, so install this inside
+# your venv on the NAS. Most desktop Python builds (Windows/macOS/Linux) already
+# include FTS5 and do NOT need this package.
+pysqlite3-binary==0.5.4.post2

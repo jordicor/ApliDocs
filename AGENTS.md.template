@@ -1,0 +1,119 @@
+<!--
+  ADMIN: this is a TEMPLATE. Copy it next to the published database (inside
+  <PUBLISH_DIR>) as AGENTS.md and replace every <PLACEHOLDER> with your real
+  values before letting agents read it. Placeholders used below:
+    <CORPUS_DESCRIPTION>  one line describing what these documents are
+    <PUBLISH_DIR>         absolute path of the folder holding the .sqlite
+    <NAS_USER>            the SSH/service user that runs and owns the index
+    <WRAPPER_PATH>        full path to the ~/bin/aplidocs wrapper
+    <SMB_PATH>            how SMB clients see the publish dir (e.g. Z:\_aplidocs)
+    <PRIVATE_DIRS>        names of folders excluded from the index (or "none")
+    <REBUILD_TIME>        when the scheduled rebuild runs (e.g. daily at 04:00)
+  Delete this comment once filled in.
+-->
+# AGENTS.md — ApliDocs full-text index
+
+Manual for any AI agent querying this document index. Technical and compact.
+
+## What this is
+
+This folder holds a single SQLite database (`aplidocs-index.sqlite`) with FTS5
+that inventories <CORPUS_DESCRIPTION>: metadata for every file plus the plain
+text extracted from the documents that carry it (pdf, docx, xlsx, odt,
+txt/md/csv, htm/html). It answers "where is X?", "which documents mention Y?"
+in milliseconds without walking the tree. It does NOT include <PRIVATE_DIRS>
+(see the hard rule below).
+
+Folder contents:
+- `aplidocs-index.sqlite` — the database (single file; no copies).
+- `cli/aplidocs_cli.py` — the query CLI (optional local copy; see access ladder).
+- `AGENTS.md` — this manual.
+
+## ALWAYS FIRST: `status` (freshness rule)
+
+Run `status` before trusting anything. It returns the `meta` row, including
+`generated_at` (UTC). **If `generated_at` is more than 2 days old, the scheduled
+rebuild (<REBUILD_TIME>) is failing**: do not trust the index, verify anything
+you are about to assert against the filesystem, and report it. A stale index
+used blindly is worse than no index.
+
+## Access ladder (best to worst)
+
+1. **SSH as `<NAS_USER>`** (recommended): run `<WRAPPER_PATH> <subcommand>`.
+   The wrapper is not on the system PATH, so call it by full path. It launches
+   the CLI with the venv python (FTS5 guaranteed). Fastest.
+
+       ssh <NAS_USER>@nas '<WRAPPER_PATH> status'
+       ssh <NAS_USER>@nas '<WRAPPER_PATH> search "quarterly report" --year 2024'
+
+2. **Mounted SMB share**: run the same `cli/aplidocs_cli.py` with the local
+   python on your machine. Modern Windows/macOS pythons ship FTS5; the CLI
+   checks at startup and fails fast with a clear message if it is missing.
+
+       python "<SMB_PATH>\cli\aplidocs_cli.py" search "contract" --db "<SMB_PATH>\aplidocs-index.sqlite"
+
+3. **No usable python**: copy the `.sqlite` to a local temp file and query it
+   with whatever you have (use the schema below for your SELECTs). If you query
+   it directly over SMB without copying, you MUST open it read-only with the URI
+   `mode=ro&immutable=1` (see "Read-only opening").
+
+## CLI contract
+
+Output is **JSON by default** (unambiguous to parse); `--tsv` is the alternative.
+
+| Subcommand | What it returns |
+|---|---|
+| `status` | `meta` row + `content_status` breakdown. **Always run first** (freshness). |
+| `search "<terms>"` | Combined FTS (content + name/path): relpath, area, snippet, score, and whether it matched by name, content, or both. Filters: `--area`, `--ext`, `--year`, `--metadata-only`, `--limit`. |
+| `name "<terms>"` | Name/path FTS only (faster, no content). Same filters. |
+| `sql "<SELECT…>"` | Escape hatch: one read-only SELECT/WITH/EXPLAIN statement, for anything the subcommands do not cover. |
+
+## Minimal schema (to write your own SELECTs)
+
+To confirm the live schema: `sql "SELECT sql FROM sqlite_master WHERE type='table'"`.
+
+- **`meta`** (one row): `schema_version`, `generated_at` (UTC ISO), `elapsed_seconds`,
+  `file_count`, `content_count`, `content_status_breakdown`, `tool_version`, `corpus_root`.
+- **`files`** (one row per file):
+  - `relpath` (key; path relative to the corpus root, UTF-8 NFC), `filename`,
+    `area` (top-level folder, or `_ROOT` for files loose at the root), `ext`
+    (lowercase), `size_bytes`, `mtime` (epoch seconds).
+  - `path_year` (first 1990-2099 year folder in the path, or null).
+  - `name_meta` (JSON object parsed from the filename convention, or null).
+  - `metadata_only` (1 if indexed by name/path only, content deliberately skipped).
+  - `content_status`: `extracted` | `empty_pdf` | `unsupported_format` |
+    `metadata_only` | `too_big` | `error` | `no_text_type`.
+- **`files_fts`**: FTS5 over `filename` and `relpath` (unicode61,
+  `remove_diacritics 2` — accents and case are folded). Answers most "where is…?".
+- **`content`**: `relpath`, `text` (plain text, whitespace collapsed, size-capped
+  per file), `extractor`, `source_sig` (size+mtime signature).
+- **`content_fts`**: FTS5 (external content) over `content` — search inside documents.
+
+## Read-only opening (MANDATORY without the CLI)
+
+If you open the `.sqlite` directly (without the CLI) and **over SMB**, always open
+it read-only with the URI `mode=ro&immutable=1`. Without `immutable=1`, SQLite
+tries to create lock/journal files next to the database and a plain SELECT over
+SMB can fail with "unable to open database file". Example in python:
+
+    import sqlite3
+    con = sqlite3.connect(
+        "file:/path/to/aplidocs-index.sqlite?mode=ro&immutable=1", uri=True)
+
+The CLI already opens this way on every channel; this rule is for manual queries.
+
+## HARD RULE — private folders
+
+<PRIVATE_DIRS> are excluded from the index at every depth: the build prunes them
+by path segment and verifies on every rebuild that not a single row carries them.
+Keep it that way — the index is read by users who must not see that material.
+Never try to reconstruct or infer their contents from the index.
+
+## Rules
+
+- **Read-only.** Never write to, modify, or delete the database. It is
+  overwritten atomically on every rebuild; anything you change is lost.
+- **Do not edit files inside `<PUBLISH_DIR>`** — the `.sqlite` is regenerated
+  <REBUILD_TIME>.
+- Treat `name_meta` and other name-derived fields as *hints*: the filesystem is
+  the source of truth. When in doubt, verify against the actual file.
