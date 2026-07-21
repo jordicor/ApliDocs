@@ -1,281 +1,429 @@
 # ApliDocs — full-text document search for your AI agents
 
-**Let your local AI agents search your NAS documents.** ApliDocs builds a single
-SQLite database with [FTS5](https://sqlite.org/fts5.html) full-text indexes over
-your filenames *and* the text inside your documents (PDF, Word, Excel, ODT,
-Markdown, HTML, plain text). A scheduled task rebuilds it nightly. Your agents —
-Claude Code and similar — then query it read-only over SSH or a mounted SMB
-share and get answers in milliseconds. **No Docker, no daemon, no embeddings, no
-cloud.** One cron task and one `.sqlite` file.
+ApliDocs builds read-only SQLite/FTS5 indexes over document names, paths and
+extracted text. There is no daemon, Docker service, vector database or cloud
+dependency: a scheduled POSIX build publishes one `.sqlite` file per access
+cohort, and agents query it locally, over SSH or through a mounted SMB share.
 
-It was extracted from a real production deployment on a small business's Synology
-NAS indexing roughly 12,000 documents, where the nightly rebuild typically
-finishes in seconds thanks to an incremental cache (the first build, which
-extracts everything, took the better part of an hour).
+The two programs intentionally have different platform contracts:
 
----
+- `build_index.py` is a **POSIX builder**. It requires descriptor-based APIs and
+  secure-open flags available on Synology/Linux and similar POSIX systems. It
+  refuses to run on Windows.
+- `aplidocs_cli.py` is a **cross-platform read-only client**. It runs on
+  Linux, macOS and Windows, including mapped drives and direct UNC paths such as
+  `\\server\share\_aplidocs\aplidocs-index.sqlite`.
 
-## Why this exists
+Both channels require SQLite `3.53.3` or newer with FTS5. Older providers are
+rejected before opening/querying an index because they predate memory-safety
+fixes reachable through a crafted FTS5 database.
 
-If you keep your documents on a NAS and you want an AI agent to answer *"where is
-the signed ACME contract?"* or *"which files mention the Q3 budget?"*, your
-options today are awkward:
+The index is disposable and can always be rebuilt from the source documents.
+It is not harmless metadata, however: it contains a searchable copy of document
+text and must be protected like the documents themselves.
 
-- **Synology Universal Search** indexes your files, but there is no clean,
-  scriptable interface an agent can call — it is built for the DSM web UI.
-- **Paperless-ngx, RAG stacks, vector databases** are powerful but heavy: they
-  run daemons and containers, they want you to import documents into *their*
-  world, and they change how you work with your files.
+## The access-cohort rule
 
-ApliDocs is the zero-maintenance middle ground. It leaves your files exactly
-where they are, adds nothing to your workflow, and exposes one thing an agent is
-good at using: a read-only query CLI with structured JSON output. The index is a
-plain SQLite file you can copy, inspect, or throw away and rebuild at any time.
+> Every person or agent allowed to read an index must also be authorized to read
+> every document included in that index.
 
-## How it works
+This is the central security invariant. ApliDocs does not copy source ACLs into
+SQLite, identify the person running a query, or enforce per-row permissions.
+Anyone who can read a published database can read every row in it, including
+text through the `sql` command.
 
-Every rebuild does four things, and **fails fast** at each one — an incomplete or
-suspicious build is never published:
+Create separate indexes when readers have different permissions. Each cohort
+needs its own configuration, `access_roots`, `access_policy_id` and
+`publish_dir`. The allowlist must contain only trees that every reader in that
+cohort may see. The broad value `"access_roots": ["."]` is an explicit assertion
+that every index reader may read the entire corpus after `prune_dirs` is
+applied; do not use it merely for convenience.
 
-1. **Walk** `corpus_root`, recording one metadata row per file. Directories you
-   list in `prune_dirs` (plus Synology's `@eaDir` and `#recycle`) are never
-   descended. If a directory cannot be listed, the whole build aborts rather than
-   silently publishing a partial index.
-2. **Extract** plain text from the formats that carry it:
+`access_policy_generation` is an administrator-controlled, canonical decimal
+revision such as `"1"`, `"2"`, `"3"`. Increase it whenever ACLs, cohort
+membership, `access_roots` or another allowlist/exclusion rule changes; never
+reuse or decrease a published value. ApliDocs also hashes the configured roots
+and exclusions, but it cannot observe an external DSM ACL policy by itself. If
+those rules change without a strictly higher generation, the next build
+aborts. A different
+`access_policy_id` in an existing `publish_dir` also aborts. Immediately before
+the first successful publication, ApliDocs creates
+`.aplidocs-publication.json`, a durable binding between that directory, the
+corpus UUID, cohort ID, policy generation, rules digest and expected POSIX
+mode/GID; failed and `--no-publish` builds do not claim an empty directory. The
+marker remains authoritative even if the SQLite database is missing or corrupt.
+A same-generation rules/permission change or a rollback is rejected from the
+marker alone. A higher generation is accepted only after the live database is
+verified against the previous marker, so a missing/corrupt database cannot be
+used to bypass the old binding. The marker records a recoverable transition
+before replacing that database and clears it only after the new inode and
+directory entry are durable; after an interruption, rerun the same new
+configuration. Do not delete or edit the marker. A generation change
+invalidates the old extraction cache.
 
-   | Format | Extensions | What is extracted |
-   |---|---|---|
-   | PDF | `pdf` | text layer via `pdftotext` (poppler/xpdf) |
-   | Word (OOXML) | `docx` `docm` `dotx` | document body text |
-   | Excel (OOXML) | `xlsx` `xlsm` `xltx` | sheet names + shared strings |
-   | OpenDocument Text | `odt` | document body text |
-   | Plain text | `txt` `md` `csv` | file contents (UTF-8, latin-1 fallback) |
-   | HTML | `htm` `html` | visible text (script/style dropped) |
-   | Legacy office | `doc` `xls` `ppt` `rtf` `msg` | recorded as `unsupported_format` (name/path only) |
-   | Anything else | — | recorded as `no_text_type` (name/path only) |
+Policy generation is cache identity, not live authorization. The previously
+published database remains readable until a replacement succeeds. For a
+revocation, remove the affected reader's access to `publish_dir` immediately
+or temporarily withdraw the cohort database, update the materialized roots and
+generation, rebuild, and only then grant the revised cohort access.
 
-   Filenames and paths are normalized to NFC; extracted text is
-   whitespace-collapsed and capped per file (500 KB). Every file gets a
-   `content_status` recording exactly what happened (see below).
-3. **Build a fresh database** in a scratch directory: the `files` / `content`
-   tables plus their FTS5 indexes. The build never mutates the live index.
-4. **Verify, then publish atomically.** Verification aborts the publish if the
-   row count does not match the walk, if any `prune_dirs` folder leaked into the
-   index, or if the optional smoke term returns no hits. Only a database that
-   passes is copied into `publish_dir` and swapped in with an atomic rename.
+## How a v2 build works
 
-**Incremental cache.** The builder reads the previously published database and
-reuses the extracted text of any file whose `size + mtime` is unchanged, so only
-new and modified documents are re-parsed. When the tool version or schema
-changes, the cache is discarded and everything is rebuilt from scratch. The first
-build of a large corpus can take many minutes; subsequent nightly builds finish
-in seconds.
+Every build is fail-closed at its important boundaries:
 
-### `content_status` values
+1. It checks that the builder has the required POSIX APIs, that `corpus_root`
+   is a real directory, that private scratch is outside both the corpus and
+   publication directory (including an exact bind-mount alias), and that the
+   pre-provisioned `publish_dir` is a real directory. It then holds an exclusive
+   lock in that publication directory through the final atomic replacement.
+2. It opens the corpus UUID marker and verifies that the mounted corpus is the
+   one durably bound to the publication directory. An empty directory may be
+   bound on first publication and a matching unbound v2 database may be adopted;
+   a changed/invalid marker or an unbound v1, corrupt or foreign database aborts
+   instead of silently reusing another cohort's directory.
+3. It walks from an open root descriptor. Directories and regular files are
+   opened without following symlinks; FIFOs and other special objects are not
+   indexed. A file must be readable before any cached text can be considered.
+   Any permission denial in the relevant/authorized traversal aborts the
+   attempt; a successful index therefore always has `excluded_access_count = 0`.
+   Detected rename or mutation races restart the complete attempt, up to the
+   configured retry count.
+4. For supported files it computes a streaming SHA-256 over the opened file.
+   Cached extraction is reused only when the exact path and hash match and the
+   schema, tool, corpus UUID and access-policy digest also match. Extraction on
+   a cache miss uses a private stable copy, so a later pathname swap cannot
+   redirect a parser outside the corpus. At the end of the walk it reopens the
+   authorized manifest, rechecks routing-component spelling plus directory/file
+   identities and signatures, and rehashes files whose content was read before
+   accepting the attempt. Routing spelling is checked both before and after the
+   potentially long rehash so a case-only SMB/CIFS rename cannot silently enter
+   the manifest.
+5. It creates schema v2 in a private scratch directory, verifies integrity,
+   counts, exclusions, optional smoke searches, the corpus marker and the
+   configured drop guards, then publishes through a unique temporary file in
+   `publish_dir` followed by an atomic rename and directory `fsync`.
 
-Every indexed file carries one of:
+Exact on-disk paths remain the primary keys in v2. Separate NFC-normalized
+columns feed FTS, so two distinct paths that normalize to the same Unicode text
+no longer collide.
+
+### Extraction formats and finite budgets
+
+| Format | Extensions | Extracted data |
+|---|---|---|
+| PDF | `pdf` | text layer via `pdftotext` |
+| Word OOXML | `docx` `docm` `dotx` | document body |
+| Excel OOXML | `xlsx` `xlsm` `xltx` | sheet names, shared/inline strings, formulas and cell values |
+| OpenDocument Text | `odt` | document body |
+| Plain text | `txt` `md` `csv` | UTF-8/16/32 BOM-aware text, then UTF-8/CP1252/Latin-1 fallback |
+| HTML | `htm` `html` | visible text with script/style bodies omitted |
+| Legacy Office | `doc` `xls` `ppt` `rtf` `msg` | name/path only (`unsupported_format`) |
+| Other files | any other extension | name/path only (`no_text_type`) |
+
+Resource use is bounded before and during parsing. The current hard limits are:
+
+- 500 KiB of final extracted UTF-8 text per file;
+- 8 MiB input for plain text/HTML;
+- 256 MiB compressed Office/ODF package, 16 MiB per selected ZIP member,
+  64 MiB selected uncompressed total, 8 MiB central directory, 10,000 ZIP
+  members, stored/deflate codecs only, a functional DEFLATE probe, 200,000 XML
+  elements and 256 XML levels;
+- 512 MiB PDF input, 500 KiB `pdftotext` output, 60 seconds and 512 MiB child
+  address space per PDF by default; a POSIX Python without the required
+  `resource` limits aborts instead of running Poppler unbounded;
+- configurable caps on entries per directory, path depth, total visited entries
+  and total indexed files;
+- 1,024 MiB aggregate extracted UTF-8 text and a 2,048 MiB SQLite page/file cap
+  per attempt by default, both configurable.
+
+An authorized POSIX filename containing undecodable bytes is rejected with its
+byte sequence in hexadecimal instead of reaching SQLite as invalid Unicode.
+Rename it to valid UTF-8 before indexing.
+
+Crossing a document limit records `too_big` and keeps name/path metadata.
+Malformed individual documents record `error`. On the first authorized PDF in
+each attempt, the builder converts a tiny PDF containing a known token. A
+missing, nonfunctional or output-dropping `pdftotext` therefore aborts the whole
+build as a system dependency failure; unexpected extractor/programming errors
+also propagate instead of being mislabeled as corrupt documents.
+
+Every file has one `content_status`:
 
 | Status | Meaning |
 |---|---|
-| `extracted` | Text was extracted (or the document was empty but parsed cleanly). |
-| `empty_pdf` | A PDF with no extractable text layer (e.g. a scan with no OCR). |
-| `unsupported_format` | Legacy office format; indexed by name/path only. |
-| `metadata_only` | Matched a `metadata_only_globs` pattern; content deliberately skipped. |
-| `too_big` | Extracted text exceeded the per-file cap; indexed by name/path only. |
-| `error` | Extraction failed for this file; recorded and retried next build. |
-| `no_text_type` | A file type with no text extractor; indexed by name/path only. |
+| `extracted` | Parsed successfully; extracted text may be empty for a non-PDF document. |
+| `empty_pdf` | PDF has no extractable text layer. |
+| `unsupported_format` | Legacy format; name/path only. |
+| `metadata_only` | A configured glob deliberately suppressed body extraction. |
+| `too_big` | A finite input/output/resource limit was exceeded. |
+| `error` | This document failed to parse and will be retried next build. |
+| `no_text_type` | No extractor exists for this extension. |
 
-## Quick start (generic Linux)
+## Quick start on Linux/POSIX
 
-Synology users: read **[docs/SYNOLOGY.md](docs/SYNOLOGY.md)** — it covers the
-DSM-specific pieces (FTS5, Task Scheduler, PATH, permissions).
+Synology users should also read [docs/SYNOLOGY.md](docs/SYNOLOGY.md).
 
 ```sh
-# 1. Get the code and (only if your Python's sqlite3 lacks FTS5) the dependency.
-git clone <your-fork-url> aplidocs && cd aplidocs
-python3 -m venv venv && . venv/bin/activate
-pip install -r requirements.txt        # installs pysqlite3-binary; see note below
+git clone <your-fork-url> aplidocs
+cd aplidocs
+python3 -m venv venv
+. venv/bin/activate
+pip install -r requirements.txt
 
-# 2. Install pdftotext for PDF support (Debian/Ubuntu example).
+# The builder probes pysqlite3 first and stdlib sqlite3 second, skipping any
+# residual provider that is too old or lacks FTS5.
+python3 - <<'PY'
+from aplidocs_common import select_fts5_provider
+import sqlite3 as stdlib_sqlite3
+candidates = []
+try:
+    import pysqlite3.dbapi2 as pysqlite3
+except Exception:
+    pass
+else:
+    candidates.append(('pysqlite3', pysqlite3))
+candidates.append(('stdlib sqlite3', stdlib_sqlite3))
+provider, label, version = select_fts5_provider(candidates)
+print(label, '.'.join(str(part) for part in version))
+PY
+
+# Debian/Ubuntu example; Synology normally provides /usr/bin/pdftotext.
 sudo apt-get install poppler-utils
 
-# 3. Configure.
 cp config.example.json config.json
-$EDITOR config.json                    # set corpus_root and publish_dir at least
+$EDITOR config.json
 
-# 4. Build the index.
+# Provision this directory and its cohort ACL/default ACL before the build.
+mkdir -p /absolute/path/to/publish_dir
+
+# Verify that the intended filesystem/share is mounted, then create its UUID once.
+python3 build_index.py --config config.json --init-corpus-id
+
+# Build, verify and publish schema v2.
 python3 build_index.py --config config.json
 
-# 5. Query it.
-python3 aplidocs_cli.py --db /path/to/publish_dir/aplidocs-index.sqlite status
+# Query the published index.
+python3 aplidocs_cli.py --db /absolute/path/to/publish_dir/aplidocs-index.sqlite status
 ```
 
-> **FTS5 note.** ApliDocs needs SQLite compiled with FTS5. Most desktop Python
-> builds already have it (`python3 -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"`
-> runs without error). If it does not, `pysqlite3-binary` from `requirements.txt`
-> provides a modern SQLite with FTS5 and the tools use it automatically.
+The corpus marker defaults to `.aplidocs-corpus-id` in `corpus_root`, is created
+with mode `0600`, and is excluded from the index. Preserve it when moving or
+restoring the same logical corpus. Never copy it into an unrelated corpus, and
+do not run `--init-corpus-id` until you have independently confirmed the
+intended mount is present.
 
-To run it nightly, point cron (or the DSM Task Scheduler) at step 4. See
-[docs/SYNOLOGY.md](docs/SYNOLOGY.md) for a ready-to-paste scheduled command.
+### Upgrading an existing v1 installation
 
-### Configuration reference
+Schema v2 is rebuilt; there is no in-place migration. Add the required cohort
+configuration keys, pre-provision the publication directory, confirm the mount,
+and run `--init-corpus-id` once. Before the first v2 build, move the v1 database
+to a private backup outside `publish_dir`: an unbound directory containing a v1,
+corrupt or foreign database is deliberately not claimed or overwritten. The
+first build then re-extracts supported documents and publishes only after
+verification. A matching unbound v2 database is adopted by creating the durable
+publication marker; subsequent builds use the strong v2 cache.
 
-`config.json` is a single JSON object. Unknown keys are rejected (typo
-protection) and every value is type-checked; any problem aborts the build before
-anything is written.
+Do not point a publication directory containing a v2 index for one corpus UUID
+at an unrelated corpus. That mismatch aborts deliberately; use a different
+cohort publication directory.
 
-| Key | Type | Default | Meaning |
+> **SQLite/FTS5 note.** ApliDocs requires SQLite `>= 3.53.3` compiled with FTS5.
+> The former `pysqlite3-binary==0.5.4.post2` fallback embeds SQLite `3.51.1`
+> and is deliberately no longer installed or accepted. There is no universal
+> safe wheel across Synology CPU/glibc/Python combinations: the POSIX builder
+> needs a current stdlib/pysqlite3-compatible vendor, container or self-built
+> provider. A read-only desktop CLI may instead use `cysqlite>=0.3.4`, which is
+> preferred automatically. The audited CPython 3.12 Windows `0.3.4` wheel
+> embeds SQLite `3.53.3`; ApliDocs still checks the version of every provider
+> at runtime. Always pass the exact-interpreter probe in
+> [docs/SYNOLOGY.md](docs/SYNOLOGY.md).
+
+## Configuration reference
+
+`config.json` must be UTF-8 JSON (a UTF-8 BOM is accepted). Unknown keys, wrong
+types, ambiguous selectors, backslash globs and relative top-level paths are
+rejected before building.
+
+| Key | Type | Default | Contract |
 |---|---|---|---|
-| `corpus_root` | string | **required** | Absolute path to the directory tree to index (relative paths are rejected — the builder runs from cron, where the working directory is undefined). |
-| `publish_dir` | string | **required** | Absolute path to the directory the finished `aplidocs-index.sqlite` is published to. If it lives inside `corpus_root` it is automatically excluded from the walk (matched by absolute path), so the index never indexes itself. It must not be `corpus_root` itself — that configuration is rejected. |
-| `prune_dirs` | list of strings | `[]` | Directory **segment names** never descended, at any depth — e.g. `["private", "personal"]`. Single names only, no `/` (paths are rejected). `@eaDir` and `#recycle` are always pruned in addition. Every name here is also verified absent from the finished index on each build. |
-| `metadata_only_globs` | list of strings | `[]` | `fnmatch` globs matched (case-sensitively) against each file's forward-slash relative path. Matches are indexed by name and path but their **content is not extracted** — useful for duplicate folders, machine-generated dumps, or anything whose body you do not want searchable. Note the `fnmatch` semantics: `*` also crosses `/`, so `reports/*` matches everything under `reports/` at any depth; and a leading `*/` requires at least one parent directory, so to match a top-level folder write `archive/duplicates/*`, not `*/archive/duplicates/*`. |
-| `filename_pattern` | string or null | `null` | Optional regular expression applied to each filename (via `re.search`). It must contain at least one **named group** (`(?P<name>...)`); on a match, the named groups (nulls dropped) are stored as a JSON object in the `name_meta` column. Lets you encode a filename convention (job codes, client names, document ids) without any schema change. An invalid regex or one without named groups aborts at startup. |
-| `smoke_term` | string or null | `null` | A non-empty term you know exists in the corpus. Verification checks it returns at least one filename hit and one content hit — a cheap guard against a build that "succeeded" but indexed nothing. When `null`, the smoke checks are skipped (the other checks still run). |
+| `corpus_root` | string | **required** | Absolute path to a real, non-symlink corpus directory. |
+| `publish_dir` | string | **required** | Absolute, pre-existing, non-symlink cohort directory. It may be inside the corpus and is excluded by filesystem identity, but cannot equal the corpus root. Apply ACL/default ACL before building. |
+| `corpus_id_file` | string | `.aplidocs-corpus-id` | One filename segment for the persistent UUID marker in the corpus root. |
+| `access_roots` | list of strings | **required** | Non-overlapping, exact on-disk allowlisted roots inside the corpus. Prefer forward-slash relative paths such as `finance/shared`; absolute paths inside `corpus_root` are accepted. Unicode identity is preserved rather than collapsed to NFC. `.` alone authorizes the entire pruned corpus. |
+| `access_policy_id` | string | **required** | Stable, human-readable identifier for the reader cohort/policy. |
+| `access_policy_generation` | string | **required** | Canonical non-negative decimal revision (`"1"`, `"2"`, …, at most `9223372036854775807`). Strictly increase it whenever ACLs, membership or allowlists/exclusions change; a bound publication rejects reuse with different rules and rejects rollback. |
+| `prune_dirs` | list of strings | `[]` | Exact NFC directory segment names never descended at any depth. `/`, `\\`, surrounding whitespace and case-ambiguous variants are rejected. `@eaDir` and `#recycle` are always pruned. |
+| `metadata_only_globs` | list of strings | `[]` | Exact-case forward-slash globs over normalized relative paths. Absolute patterns and empty, `.` or `..` segments are rejected. A match keeps name/path but suppresses body text; a path matching only after case-folding aborts as an ambiguous privacy selector. `*` follows Python `fnmatch` semantics and can cross `/`. |
+| `filename_pattern` | string or null | `null` | Optional regular expression (maximum 1,024 UTF-8 bytes) with at least one named group. Captures are stored as JSON in `name_meta`; every filename match has a 100 ms POSIX interval-timer budget, and a timeout aborts the build. |
+| `smoke_term` | string or null | `null` | Known non-empty term that must match both filename/path FTS and content FTS before publication. |
+| `allow_empty` | boolean | `false` | Explicit opt-in to permit zero files. `min_file_count` still applies. |
+| `min_file_count` | integer | `1` | Absolute minimum file-row count required to publish. Set this to a meaningful floor for the corpus. |
+| `max_file_count_drop_fraction` | number | `0.5` | Maximum fractional fall from the prior build with the same policy digest, from `0` to `1`. An intentional large allowlist reduction must use a new `access_policy_generation`. |
+| `max_walk_retries` | integer | `2` | Complete retries after concurrent corpus mutation, from `0` to `10`. |
+| `max_directory_entries` | integer | `50000` | Maximum relevant entries retained from one authorized directory (`1`–`1000000`). At routing ancestors, a bounded streaming name scan verifies exact spelling on case-insensitive filesystems; unrelated siblings are neither retained nor statted/opened. |
+| `max_directory_depth` | integer | `128` | Maximum authorized traversal depth (`1`–`512`), bounding recursion and open descriptors. |
+| `max_total_entries` | integer | `2000000` | Maximum relevant entries visited in one attempt (`1`–`10000000`). |
+| `max_total_files` | integer | `1000000` | Maximum indexed files and previous-cache rows loaded (`1`–`10000000`). |
+| `max_total_extracted_mb` | integer | `1024` | Aggregate UTF-8 bytes allowed in extracted content for one index (`1`–`1048576` MiB); crossing it aborts rather than publishing partial text. |
+| `max_index_size_mb` | integer | `2048` | Maximum scratch SQLite page/file size (`1`–`1048576` MiB), enforced with `max_page_count` and verified before publication. |
+| `pdf_memory_limit_mb` | integer | `512` | POSIX address-space limit for each `pdftotext` child (`128`–`4096` MiB). Tune for the NAS and representative PDFs. |
+| `publish_mode` | octal string | `0640` | Final POSIX file mode. Owner read/write is required; group/other write is forbidden. It is persisted policy state, so changing it requires a higher `access_policy_generation`. |
+| `publish_group` | string or null | `null` | Optional existing POSIX group assigned before publication. With group permission bits and `null`, the expected inherited/effective GID is still pinned in the publication marker. Changing the expected GID requires a higher generation. This is not a DSM ACL validator. |
+
+Changing configured roots/prunes/globs or publication mode/group changes the
+policy digest automatically; bumping `access_policy_generation` as part of the
+same administrative change makes the external ACL revision explicit and
+prevents reuse of prior text.
+
+### Empty, detached and changing corpora
+
+The UUID marker catches the common “mount disappeared but mountpoint remained”
+case. Every configured `access_root` must also be found and readable during the
+walk. `allow_empty=false` and `min_file_count` provide absolute guards. The drop
+fraction detects an unexpectedly large disappearance relative to the last build
+with the same policy. Any relevant `EACCES`/`EPERM` aborts before publication;
+`excluded_access_count` is retained as an invariant/audit field and must be zero
+in a successful database. For an intentional ACL/allowlist change, bump
+`access_policy_generation`; if the rules digest changes without that bump, the
+build aborts.
+
+Detected concurrent rename/write activity causes a whole-walk retry, not a
+known partial publication. The final manifest pass closes the ordinary race in
+which an early path changes later in the walk, but ApliDocs cannot create an
+atomic filesystem-wide snapshot: a write can still occur after that path's last
+validation. Use a read-only filesystem/storage snapshot as `corpus_root` when a
+globally point-in-time index is required. With `max_walk_retries=2`, continued
+detected churn aborts and leaves the previous published index in place.
+
+## Private scratch and atomic publication
+
+By default scratch is `<repository>/build/aplidocs-index.sqlite`. The builder
+creates a missing scratch directory as `0700`; if it already exists, any
+group/other permission bits cause an abort instead of being silently changed.
+The database and stable source copies are `0600`; scratch paths inside either
+the corpus or `publish_dir` are rejected before cleanup can unlink anything.
+After a successful normal publication the scratch database is removed. A second
+lock tied to the exact scratch output prevents two cohort builds with different
+publication directories from racing on this default file.
+
+- `--keep-build` retains scratch after a successful publication.
+- `--no-publish` builds and verifies for diagnostics/tests, retains scratch and
+  does not replace the live database.
+- A failed build may retain private scratch for diagnosis; it is never
+  published and can be removed after investigation.
+
+Capacity planning must allow the old live index, scratch database/rollback
+journal and the publication temporary to coexist. Each database is capped by
+`max_index_size_mb`; SQLite temporary/journal work can require additional space.
+
+`publish_dir` must already exist with the cohort's directory ACL and inheritable
+or default ACL configured. The final SQLite inode receives `publish_mode` and,
+if set, `publish_group`; when group bits are enabled without an explicit group,
+the setgid-directory GID or builder effective GID is expected instead. The same
+mode and pinned GID apply to the durable `.aplidocs-publication.json`
+corpus/cohort/policy-state binding. The code validates regular-file type, POSIX
+mode and group, but **does not inspect or prove
+Synology/DSM extended ACLs**. Because each publish creates a new inode, verify
+effective access with a real cohort reader after initial setup and after ACL
+changes. Readers need no write permission on the database or publication
+directory; only the builder and administrators should be able to create,
+replace or delete files there.
 
 ## CLI reference
 
-`aplidocs_cli.py` is a single read-only file. It opens the database
-`mode=ro&immutable=1` on every channel, so a plain query — even directly over SMB
-— can never create lock or journal files next to your `.sqlite`. Output is
-**JSON by default**; pass `--tsv` for tab-separated rows.
+The CLI opens SQLite with `mode=ro&immutable=1`; it never creates `-journal`,
+`-wal` or `-shm` files. Its URI helper preserves percent-encoding and converts a
+Windows UNC path to SQLite's empty-authority form, avoiding the stock SQLite
+`invalid uri authority` failure.
 
-Two global flags may appear **before or after** the subcommand:
+For a reproducible Windows/SMB client, use a dedicated 64-bit CPython 3.12 venv
+and the exact `win_amd64` cysqlite wheel audited for this release. The probe is mandatory: an
+old `pysqlite3-binary` left in an existing venv is skipped automatically, but
+the client still needs at least one safe provider.
 
-- `--db PATH` — the database to query. If omitted, the CLI looks for
-  `aplidocs-index.sqlite` in its parent directory (drop a copy of the CLI in
-  `<publish_dir>/cli/` and it just works) and then next to itself.
-- `--tsv` — tab-separated output instead of JSON.
+```powershell
+py -3.12 -c "import struct; assert struct.calcsize('P') == 8"
+py -3.12 -m venv .venv-aplidocs
+.\.venv-aplidocs\Scripts\python.exe -m pip install cysqlite==0.3.4
+.\.venv-aplidocs\Scripts\python.exe -c "import cysqlite as s; print(s.sqlite_version); assert s.sqlite_version_info >= (3,53,3); s.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"
+.\.venv-aplidocs\Scripts\python.exe .\aplidocs_cli.py --db "\\server\share\_aplidocs\aplidocs-index.sqlite" status
+```
 
-### `status` — always run this first
+```powershell
+python .\aplidocs_cli.py --db "\\server\share\_aplidocs\aplidocs-index.sqlite" status
+python .\aplidocs_cli.py --db "Z:\_aplidocs\aplidocs-index.sqlite" search "ACME invoice" --limit 5
+```
 
-Returns the `meta` row, including `generated_at` (UTC). Agents should check
-freshness before trusting the index: a `generated_at` more than a day or two old
-means the scheduled rebuild is failing.
+Global options may appear before or after the subcommand:
+
+- `--db PATH`: database path. Without it, the CLI checks the parent of its own
+  directory and then its own directory. An empty value is rejected.
+- `--tsv`: tab-separated output instead of JSON.
+
+`--db` may be supplied only once. The cohort wrapper rejects it from caller
+arguments so its fixed database cannot be replaced. This is defense in depth;
+filesystem/DSM ACLs must still prevent that account from reading other cohorts.
+TSV output replaces control characters and quotes formula-leading string cells;
+JSON preserves the original data safely.
+
+Commands:
+
+- `status`: build freshness and core `meta` information; run it before search.
+- `search "terms"`: deterministic reciprocal-rank fusion of filename/path and
+  content FTS results, with `matched_by` and content snippets.
+- `name "terms"`: filename/path FTS only.
+- `sql "SELECT ..."`: one read-only `SELECT`, `WITH` or `EXPLAIN` statement.
+
+`search` and `name` accept `--area`, `--ext`, `--year`, `--metadata-only` and a
+`--limit` from 1 to 1000 (default 20). Combined search computes exact RRF while
+each source has at most 10,000 matches; broader queries fail with a request to
+add terms/filters instead of returning an approximate rank. Candidate ranking
+loads only relpaths/scores; metadata and at-most-2,048-character snippets are
+generated only for the final `--limit` results.
+
+The `sql` command streams rows and requires a SQLite provider exposing
+`Connection.setlimit`, `getlimit` and either stdlib `set_progress_handler` or
+cysqlite's equivalent `progress` API (`setlimit` starts with CPython 3.11 in the
+stdlib). Builder, `status`, `search` and `name` remain supported on Python 3.8+
+when a safe compatible provider is available; without the required SQL budget
+APIs, `sql` fails closed with exit code 3. Its budgets are 64 KiB of query text,
+24 result columns, 1 MiB per SQLite value, 1,000 rows, 4 MiB of encoded JSON,
+five million VM steps and five seconds. BLOBs are explicit base64 objects and
+non-finite SQLite REAL values use `{"$float":"infinity"}`-style tags, so output
+remains valid JSON.
+
+### Schema v2
+
+- `meta`: one row with build timing/counts plus `corpus_uuid`,
+  `access_policy_id`, `access_policy_generation`, `policy_digest`, serialized
+  `access_roots` and `excluded_access_count` (zero for every successful
+  fail-closed build).
+- `files`: exact `relpath` primary key and exact `filename`; separate
+  `relpath_nfc`/`filename_nfc` search columns; `area` (`.` for a root-level
+  file), extension, size, seconds/nanoseconds timestamps, device/inode,
+  `source_hash`, optional year/name metadata and extraction status.
+- `content`: extracted text, extractor and strong `source_sig` keyed by exact
+  relative path.
+- `files_fts` and `content_fts`: FTS5 external-content indexes.
+
+Inspect the live definition with:
 
 ```sh
-aplidocs status
-```
-```json
-{
-  "schema_version": 1,
-  "generated_at": "2026-05-01T02:00:11Z",
-  "elapsed_seconds": 8.4,
-  "file_count": 11842,
-  "content_count": 9317,
-  "content_status": { "extracted": 9317, "empty_pdf": 214, "unsupported_format": 1802, "no_text_type": 509 },
-  "tool_version": "aplidocs/1.0",
-  "corpus_root": "/volume1/documents"
-}
+aplidocs sql "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
 ```
 
-### `search` — combined name + content search
-
-Full-text search across both filenames/paths and document contents, merged and
-ranked. Each hit says whether it `matched_by` `"name"`, `"content"`, or `"both"`,
-and content matches carry a highlighted `snippet`.
-
-```sh
-aplidocs search "ACME invoice" --year 2024 --limit 5
-```
-```json
-[
-  {
-    "relpath": "invoices/2024/2024 invoice ACME Corp.pdf",
-    "area": "invoices",
-    "ext": "pdf",
-    "path_year": 2024,
-    "name_meta": null,
-    "size_bytes": 184320,
-    "mtime": 1714526411,
-    "metadata_only": 0,
-    "content_status": "extracted",
-    "matched_by": "both",
-    "snippet": "… total due on this [invoice] from [ACME] Corp …",
-    "score": -3.41
-  }
-]
-```
-
-Filters available on `search` and `name`: `--area` (top-level folder), `--ext`
-(file extension), `--year` (matches `path_year`), `--metadata-only` (only files
-whose content was intentionally skipped), `--limit` (default 20).
-
-### `name` — filename / path search only
-
-Faster than `search` because it never touches document content. Same filters.
-
-```sh
-aplidocs name "meeting notes" --ext docx
-```
-
-### `sql` — the read-only escape hatch
-
-For questions the subcommands do not cover, run a single `SELECT` / `WITH` /
-`EXPLAIN` statement. Anything else is rejected, and the connection is read-only
-and immutable regardless.
-
-```sh
-aplidocs sql "SELECT area, COUNT(*) AS n FROM files GROUP BY area ORDER BY n DESC"
-```
-
-The schema is small: `meta` (one row of build stats), `files` (one row per file:
-`relpath`, `filename`, `area`, `ext`, `size_bytes`, `mtime`, `path_year`,
-`name_meta`, `metadata_only`, `content_status`), `content` (extracted text), and
-the `files_fts` / `content_fts` FTS5 indexes. Confirm the live schema any time
-with `sql "SELECT sql FROM sqlite_master WHERE type='table'"`.
+The `sql` escape hatch exposes every included row, which is why the cohort rule
+is mandatory rather than optional guidance.
 
 ## Using it from an AI agent
 
-ApliDocs is designed to be handed to an agent with a short manual. The repo ships
-**`AGENTS.md.template`**: fill in its `<PLACEHOLDERS>` (publish directory, the
-SSH user, a one-line description of your corpus, the names of any private
-folders) and drop the result next to the published database as `AGENTS.md`. An
-agent that reads it knows to run `status` first, how to invoke the CLI by full
-path, the meaning of every column, and the hard rule never to touch excluded
-folders.
+Fill in `AGENTS.md.template` and place the result beside the cohort database.
+It tells an agent to check freshness, use a full wrapper path over SSH, and
+treat exclusions and cohort boundaries as hard limits. Example queries:
 
-Example prompts an agent can satisfy with a single CLI call:
-
-- *"Find the latest signed contract with ACME Corp."* → `search "ACME contract" --limit 5`
-- *"Which spreadsheets mention the Q3 budget?"* → `search "Q3 budget" --ext xlsx`
-- *"List everything filed under 2023."* → `sql "SELECT relpath FROM files WHERE path_year = 2023 ORDER BY relpath"`
-
-**Why read-only + immutable matters over SMB.** When a database is opened
-normally, SQLite may create `-wal`, `-shm`, or `-journal` sidecar files next to
-it. Over an SMB mount that often fails outright ("unable to open database file")
-and, worse, would litter your share. Opening with `mode=ro&immutable=1` tells
-SQLite the file will not change underneath it, so it never attempts any of that.
-The CLI always does this; agents querying the raw `.sqlite` without the CLI must
-do the same.
-
-**The `sql` escape hatch** exists so an agent is never boxed in by the fixed
-subcommands, while the `SELECT`/`WITH`/`EXPLAIN` gate plus the read-only
-immutable connection keep it from doing anything but reading.
-
-## Security
-
-- **Read-only by construction.** Every connection is opened `mode=ro&immutable=1`.
-  The `sql` subcommand additionally rejects any statement that is not
-  `SELECT` / `WITH` / `EXPLAIN`, and extension loading is never enabled. There is
-  no code path that writes to a published index.
-- **Private folders stay out — and it is verified.** List sensitive directories
-  in `prune_dirs`; the walk never descends them, and every build re-checks that
-  not a single row carries that path segment, aborting the publish if one does.
-  This is a build-time guarantee, not a filter applied at query time.
-- **Enforce filesystem permissions too.** `prune_dirs` keeps folders out of the
-  *index*; it does not change who can read the originals. Put real ACLs on
-  sensitive folders as well. Treat the two as layers, not substitutes.
-- **The index is a copy of your data.** The `content` table holds the extracted
-  text of your documents. Protect `publish_dir` like the originals: restrict who
-  can read it, and restrict who can *write* it so ordinary users cannot delete or
-  tamper with the index (only the build user and admins should have write access).
-
-## Synology setup
-
-The DSM-specific guide — venv + FTS5, Task Scheduler, the `~/bin` PATH gotcha,
-subvolume/rename behavior, and permission hardening — lives in
-**[docs/SYNOLOGY.md](docs/SYNOLOGY.md)**.
+- `aplidocs search "ACME contract" --limit 5`
+- `aplidocs search "Q3 budget" --ext xlsx`
+- `aplidocs sql "SELECT relpath FROM files WHERE path_year = 2023 ORDER BY relpath"`
 
 ## License
 

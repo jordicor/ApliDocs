@@ -1,24 +1,42 @@
 #!/bin/sh
-# ApliDocs CLI wrapper.
+# ApliDocs read-only CLI wrapper for one access cohort.
 #
 # Install:  copy this file to ~/bin/aplidocs, then `chmod 755 ~/bin/aplidocs`.
 # Agents must call it by FULL PATH (~/bin is NOT on the PATH for non-interactive
 # SSH sessions -- see docs/SYNOLOGY.md), e.g.
 #     /var/services/homes/YOURUSER/bin/aplidocs status
 #
-# Edit the three absolute paths below to match your install:
-#   VENV_PY  the venv Python that has FTS5 (pysqlite3-binary installed)
+# Make a separate wrapper (and DB path) for every cohort. Anyone who can read
+# DB can read every document row and extracted text it contains; source-file
+# ACLs are not re-applied by SQLite.
+#
+# Edit the three absolute paths below to match your POSIX/SSH install:
+#   VENV_PY  a Python verified to use SQLite >= 3.53.3 with FTS5
 #   CLI      aplidocs_cli.py
-#   DB       the published aplidocs-index.sqlite (inside publish_dir)
+#   DB       this cohort's published aplidocs-index.sqlite (inside publish_dir)
 #
 # Passing --db here makes DB discovery explicit and layout-independent. If you
-# instead drop a copy of aplidocs_cli.py in <publish_dir>/cli/, the CLI finds
-# the database on its own and you can remove the --db argument.
+# instead place both aplidocs_cli.py and aplidocs_common.py in
+# <publish_dir>/cli/, the CLI finds the database on its own and you can remove
+# the --db argument.
 #
-# -B keeps Python from writing .pyc files next to the CLI.
+# -B keeps Python from writing .pyc files next to the CLI. Windows clients can
+# instead call aplidocs_cli.py directly with a mapped-drive or UNC --db path;
+# build_index.py itself remains POSIX-only.
 
 VENV_PY="$HOME/apps/venv/bin/python"
 CLI="$HOME/apps/aplidocs/aplidocs_cli.py"
 DB="/volume1/documents/_aplidocs/aplidocs-index.sqlite"
+
+# Do not let callers override this cohort wrapper's fixed database. The CLI
+# also rejects duplicate --db flags, but this produces a clearer boundary here.
+for arg in "$@"; do
+    case "$arg" in
+        --db|--db=*)
+            echo "aplidocs: this cohort wrapper does not allow --db" >&2
+            exit 2
+            ;;
+    esac
+done
 
 exec "$VENV_PY" -B "$CLI" --db "$DB" "$@"

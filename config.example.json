@@ -1,8 +1,25 @@
 {
   "corpus_root": "/volume1/documents",
   "publish_dir": "/volume1/documents/_aplidocs",
+  "corpus_id_file": ".aplidocs-corpus-id",
+  "access_roots": ["."],
+  "access_policy_id": "shared-documents-readers",
+  "access_policy_generation": "1",
   "prune_dirs": ["private", "personal"],
   "metadata_only_globs": ["archive/duplicates/*", "reports/generated_index.csv"],
   "filename_pattern": "^(?P<year>\\d{4})-(?P<department>[A-Z]{2,4})-(?P<doc_id>\\d+)\\b",
-  "smoke_term": "invoice"
+  "smoke_term": "invoice",
+  "allow_empty": false,
+  "min_file_count": 1,
+  "max_file_count_drop_fraction": 0.5,
+  "max_walk_retries": 2,
+  "max_directory_entries": 50000,
+  "max_directory_depth": 128,
+  "max_total_entries": 2000000,
+  "max_total_files": 1000000,
+  "max_total_extracted_mb": 1024,
+  "max_index_size_mb": 2048,
+  "pdf_memory_limit_mb": 512,
+  "publish_mode": "0640",
+  "publish_group": null
 }

@@ -1,9 +1,13 @@
-# ApliDocs runs on Python 3.8+ using only the standard library, plus the
-# external command `pdftotext` (poppler/xpdf) on PATH for PDF text extraction.
+# ApliDocs requires an SQLite provider with FTS5 and SQLite >= 3.53.3. The old
+# pysqlite3-binary fallback is intentionally not installed: its latest
+# 0.5.4.post2 wheel embeds SQLite 3.51.1, before the FTS5 memory-safety fixes.
 #
-# The single dependency below is ONLY needed when your Python's built-in
-# sqlite3 module was not compiled with a usable FTS5 extension. Synology DSM
-# 7.x ships Python 3.8 whose bundled sqlite3 lacks FTS5, so install this inside
-# your venv on the NAS. Most desktop Python builds (Windows/macOS/Linux) already
-# include FTS5 and do NOT need this package.
-pysqlite3-binary==0.5.4.post2
+# There is no single safe wheel compatible with every Synology CPU/glibc/Python
+# combination. Probe the exact scheduled interpreter as documented in
+# docs/SYNOLOGY.md. For read-only CLI clients, cysqlite is preferred where
+# compatible; the audited CPython 3.12 win_amd64 cysqlite 0.3.4 wheel embeds
+# SQLite 3.53.3, and runtime checks remain mandatory. The builder needs a
+# current stdlib/pysqlite3-compatible provider from a vendor, container or
+# self-built Python. The reproducible Windows client command is intentionally
+# separate and pins cysqlite==0.3.4; see README.md. PDF extraction additionally
+# requires `pdftotext`.

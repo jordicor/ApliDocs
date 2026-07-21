@@ -1,119 +1,143 @@
 <!--
-  ADMIN: this is a TEMPLATE. Copy it next to the published database (inside
-  <PUBLISH_DIR>) as AGENTS.md and replace every <PLACEHOLDER> with your real
-  values before letting agents read it. Placeholders used below:
-    <CORPUS_DESCRIPTION>  one line describing what these documents are
-    <PUBLISH_DIR>         absolute path of the folder holding the .sqlite
-    <NAS_USER>            the SSH/service user that runs and owns the index
-    <WRAPPER_PATH>        full path to the ~/bin/aplidocs wrapper
-    <SMB_PATH>            how SMB clients see the publish dir (e.g. Z:\_aplidocs)
-    <PRIVATE_DIRS>        names of folders excluded from the index (or "none")
-    <REBUILD_TIME>        when the scheduled rebuild runs (e.g. daily at 04:00)
-  Delete this comment once filled in.
+  ADMIN: copy this template beside the published cohort database as AGENTS.md,
+  replace every placeholder, then delete this comment.
+
+    <CORPUS_DESCRIPTION>   one-line description of the corpus
+    <COHORT_DESCRIPTION>   exactly who may read this index
+    <ACCESS_POLICY_ID>     access_policy_id from the build config
+    <AUTHORIZED_ROOTS>     roots included in this cohort index
+    <PUBLISH_DIR>          absolute POSIX path holding the database
+    <NAS_USER>             SSH/service account used to query it
+    <WRAPPER_PATH>         absolute path to this cohort's wrapper
+    <SMB_PATH>             mapped or UNC publication path
+    <EXCLUDED_DIRS>        pruned/excluded directory names, or "none"
+    <REBUILD_TIME>         schedule, for example "daily at 04:00"
 -->
-# AGENTS.md — ApliDocs full-text index
+# AGENTS.md — ApliDocs schema-v2 cohort index
 
-Manual for any AI agent querying this document index. Technical and compact.
+This directory publishes one read-only SQLite/FTS5 index for
+<CORPUS_DESCRIPTION>.
 
-## What this is
+The query interpreter must use SQLite 3.53.3 or newer; ApliDocs rejects older
+providers before opening this FTS5 index.
 
-This folder holds a single SQLite database (`aplidocs-index.sqlite`) with FTS5
-that inventories <CORPUS_DESCRIPTION>: metadata for every file plus the plain
-text extracted from the documents that carry it (pdf, docx, xlsx, odt,
-txt/md/csv, htm/html). It answers "where is X?", "which documents mention Y?"
-in milliseconds without walking the tree. It does NOT include <PRIVATE_DIRS>
-(see the hard rule below).
+- Authorized reader cohort: <COHORT_DESCRIPTION>
+- Access policy: `<ACCESS_POLICY_ID>`
+- Included roots: <AUTHORIZED_ROOTS>
+- Excluded/pruned directories: <EXCLUDED_DIRS>
+- Scheduled rebuild: <REBUILD_TIME>
 
-Folder contents:
-- `aplidocs-index.sqlite` — the database (single file; no copies).
-- `cli/aplidocs_cli.py` — the query CLI (optional local copy; see access ladder).
-- `AGENTS.md` — this manual.
+## Security boundary
 
-## ALWAYS FIRST: `status` (freshness rule)
+This database has no per-row ACL. Any reader can retrieve every included path
+and all included extracted text, including through `sql`. The administrator has
+therefore built it only from roots that every member of <COHORT_DESCRIPTION> may
+read.
 
-Run `status` before trusting anything. It returns the `meta` row, including
-`generated_at` (UTC). **If `generated_at` is more than 2 days old, the scheduled
-rebuild (<REBUILD_TIME>) is failing**: do not trust the index, verify anything
-you are about to assert against the filesystem, and report it. A stale index
-used blindly is worse than no index.
+Do not give this database to anybody outside that cohort. Do not infer or try to
+reconstruct material outside <AUTHORIZED_ROOTS> or inside <EXCLUDED_DIRS> from
+its absence. The source filesystem, not this index, is authoritative.
 
-## Access ladder (best to worst)
+## Always run `status` first
 
-1. **SSH as `<NAS_USER>`** (recommended): run `<WRAPPER_PATH> <subcommand>`.
-   The wrapper is not on the system PATH, so call it by full path. It launches
-   the CLI with the venv python (FTS5 guaranteed). Fastest.
+Run `status` before trusting search results. If `generated_at` is more than two
+days old, the scheduled build is failing: report the stale timestamp and verify
+important claims against the source filesystem.
+
+The schema-v2 `meta` table also records the corpus UUID, policy ID/generation,
+authorized roots and `excluded_access_count`. A successful fail-closed build must
+publish that count as zero. Treat a non-zero value as an invalid/legacy index and
+flag it; current builders abort instead of publishing permission-denied omissions.
+
+## Access ladder
+
+1. Recommended, over SSH:
 
        ssh <NAS_USER>@nas '<WRAPPER_PATH> status'
        ssh <NAS_USER>@nas '<WRAPPER_PATH> search "quarterly report" --year 2024'
 
-2. **Mounted SMB share**: run the same `cli/aplidocs_cli.py` with the local
-   python on your machine. Modern Windows/macOS pythons ship FTS5; the CLI
-   checks at startup and fails fast with a clear message if it is missing.
+   Use the full wrapper path because non-interactive SSH may not load `~/bin`
+   into `PATH`.
 
-       python "<SMB_PATH>\cli\aplidocs_cli.py" search "contract" --db "<SMB_PATH>\aplidocs-index.sqlite"
+2. From a mounted SMB share, use a local Python and the read-only CLI:
 
-3. **No usable python**: copy the `.sqlite` to a local temp file and query it
-   with whatever you have (use the schema below for your SELECTs). If you query
-   it directly over SMB without copying, you MUST open it read-only with the URI
-   `mode=ro&immutable=1` (see "Read-only opening").
+       python "<SMB_PATH>\cli\aplidocs_cli.py" --db "<SMB_PATH>\aplidocs-index.sqlite" status
+
+   Windows mapped drives and direct UNC paths (`\\server\share\...`) are
+   supported. The builder is POSIX-only; Windows is a query client. Prepare the
+   client venv as documented in README (the audited setup pins
+   `cysqlite==0.3.4`) and run its SQLite-version/FTS5 probe first.
+
+3. Without the CLI, copy the database to a private local temporary and use a
+   compatible SQLite/FTS5 tool. If it must be opened directly over SMB, use a
+   correctly percent-encoded SQLite file URI with `mode=ro&immutable=1`.
 
 ## CLI contract
 
-Output is **JSON by default** (unambiguous to parse); `--tsv` is the alternative.
+JSON is the default output. `--tsv` requests tab-separated rows.
 
-| Subcommand | What it returns |
+| Command | Result |
 |---|---|
-| `status` | `meta` row + `content_status` breakdown. **Always run first** (freshness). |
-| `search "<terms>"` | Combined FTS (content + name/path): relpath, area, snippet, score, and whether it matched by name, content, or both. Filters: `--area`, `--ext`, `--year`, `--metadata-only`, `--limit`. |
-| `name "<terms>"` | Name/path FTS only (faster, no content). Same filters. |
-| `sql "<SELECT…>"` | Escape hatch: one read-only SELECT/WITH/EXPLAIN statement, for anything the subcommands do not cover. |
+| `status` | Freshness and core build metadata. Always run first. |
+| `search "terms"` | Fused name/path and body-text results with match source and optional snippet. |
+| `name "terms"` | Filename/path FTS only. |
+| `sql "SELECT ..."` | One bounded, read-only `SELECT`, `WITH` or `EXPLAIN` statement; requires a provider with `setlimit`/`getlimit`/progress-handler support. |
 
-## Minimal schema (to write your own SELECTs)
+`search` and `name` support `--area`, `--ext`, `--year`, `--metadata-only` and a
+`--limit` is bounded from 1 to 1000; an overly broad combined search may also
+ask for more terms/filters rather than approximate RRF beyond its candidate cap.
+Only final hits receive metadata/snippets. On providers without all three
+required capabilities (`Connection.setlimit`, `getlimit` and a progress
+handler such as stdlib `set_progress_handler` or cysqlite `progress`), `sql`
+intentionally exits 3; use the other commands or ask the administrator for a
+compatible provider. Do not bypass a cohort wrapper with
+`--db`; current wrappers reject that argument. Source ACLs
+do not filter rows in the index: the publication-directory/database ACL is the
+effective read boundary, while the source remains authoritative for document
+facts.
 
-To confirm the live schema: `sql "SELECT sql FROM sqlite_master WHERE type='table'"`.
+Examples:
 
-- **`meta`** (one row): `schema_version`, `generated_at` (UTC ISO), `elapsed_seconds`,
-  `file_count`, `content_count`, `content_status_breakdown`, `tool_version`, `corpus_root`.
-- **`files`** (one row per file):
-  - `relpath` (key; path relative to the corpus root, UTF-8 NFC), `filename`,
-    `area` (top-level folder, or `_ROOT` for files loose at the root), `ext`
-    (lowercase), `size_bytes`, `mtime` (epoch seconds).
-  - `path_year` (first 1990-2099 year folder in the path, or null).
-  - `name_meta` (JSON object parsed from the filename convention, or null).
-  - `metadata_only` (1 if indexed by name/path only, content deliberately skipped).
-  - `content_status`: `extracted` | `empty_pdf` | `unsupported_format` |
-    `metadata_only` | `too_big` | `error` | `no_text_type`.
-- **`files_fts`**: FTS5 over `filename` and `relpath` (unicode61,
-  `remove_diacritics 2` — accents and case are folded). Answers most "where is…?".
-- **`content`**: `relpath`, `text` (plain text, whitespace collapsed, size-capped
-  per file), `extractor`, `source_sig` (size+mtime signature).
-- **`content_fts`**: FTS5 (external content) over `content` — search inside documents.
+    <WRAPPER_PATH> search "ACME contract" --limit 5
+    <WRAPPER_PATH> search "Q3 budget" --ext xlsx
+    <WRAPPER_PATH> name "meeting notes" --year 2025
+    <WRAPPER_PATH> sql "SELECT relpath FROM files WHERE path_year = 2023 ORDER BY relpath"
 
-## Read-only opening (MANDATORY without the CLI)
+To inspect policy/build state not shown by a particular CLI version:
 
-If you open the `.sqlite` directly (without the CLI) and **over SMB**, always open
-it read-only with the URI `mode=ro&immutable=1`. Without `immutable=1`, SQLite
-tries to create lock/journal files next to the database and a plain SELECT over
-SMB can fail with "unable to open database file". Example in python:
+    <WRAPPER_PATH> sql "SELECT generated_at, file_count, corpus_uuid, access_policy_id, access_policy_generation, access_roots, excluded_access_count FROM meta"
 
-    import sqlite3
-    con = sqlite3.connect(
-        "file:/path/to/aplidocs-index.sqlite?mode=ro&immutable=1", uri=True)
+## Minimal schema v2
 
-The CLI already opens this way on every channel; this rule is for manual queries.
+- `meta` has one row: schema/tool version, UTC generation time, elapsed time,
+  file/content counts and status JSON, `corpus_root`, `corpus_uuid`,
+  `access_policy_id`, `access_policy_generation`, `policy_digest`, serialized
+  `access_roots` and `excluded_access_count`.
+- `files` has one row per included file. `relpath` and `filename` preserve exact
+  on-disk spelling; `relpath_nfc` and `filename_nfc` are normalized search
+  forms. Other useful columns include `area` (`.` for a file loose at corpus
+  root), lowercase `ext`, size, `mtime`/`mtime_ns`/`ctime_ns`, device/inode,
+  `source_hash`, `path_year`, optional `name_meta`, `metadata_only` and
+  `content_status`.
+- `content` has extracted `text`, `extractor` and strong `source_sig`, keyed by
+  exact `relpath`.
+- `files_fts` searches normalized filename/path; `content_fts` searches body
+  text. Both use FTS5 `unicode61 remove_diacritics 2`.
 
-## HARD RULE — private folders
+`content_status` is one of `extracted`, `empty_pdf`, `unsupported_format`,
+`metadata_only`, `too_big`, `error` or `no_text_type`. `metadata_only` still
+reveals the file's name/path; it only suppresses body extraction.
 
-<PRIVATE_DIRS> are excluded from the index at every depth: the build prunes them
-by path segment and verifies on every rebuild that not a single row carries them.
-Keep it that way — the index is read by users who must not see that material.
-Never try to reconstruct or infer their contents from the index.
+Confirm the live schema when needed:
 
-## Rules
+    <WRAPPER_PATH> sql "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
 
-- **Read-only.** Never write to, modify, or delete the database. It is
-  overwritten atomically on every rebuild; anything you change is lost.
-- **Do not edit files inside `<PUBLISH_DIR>`** — the `.sqlite` is regenerated
-  <REBUILD_TIME>.
-- Treat `name_meta` and other name-derived fields as *hints*: the filesystem is
-  the source of truth. When in doubt, verify against the actual file.
+## Read-only rules
+
+- Never write, modify, replace or delete anything in `<PUBLISH_DIR>`.
+- The builder atomically replaces the SQLite file on every successful rebuild;
+  do not keep a long-lived connection and assume it will see a later version.
+- Trust `name_meta` and path-derived fields only as hints. Verify decisive facts
+  against an authorized source document.
+- Never widen access to the database on the theory that original DSM ACLs will
+  filter results. They do not apply inside this index.
