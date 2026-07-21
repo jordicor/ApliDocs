@@ -1002,7 +1002,7 @@ def _minimal_pdf_probe_bytes():
     objects = (
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] "
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 72] "
         b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
         (b"<< /Length %d >>\nstream\n" % len(content))
         + content

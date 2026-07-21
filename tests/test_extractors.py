@@ -10,6 +10,7 @@ import codecs
 import json
 import os
 import pathlib
+import re
 import subprocess
 import struct
 import sys
@@ -679,6 +680,28 @@ class TextAndXmlRegressionTests(unittest.TestCase):
 
 
 class PdfRegressionTests(unittest.TestCase):
+    def test_pdf_probe_text_fits_inside_media_box(self):
+        """The functional-probe token must not be clipped by the PDF page."""
+        payload = build_index._minimal_pdf_probe_bytes()
+        layout = re.search(
+            rb"/MediaBox \[0 0 (?P<page_width>\d+) (?P<page_height>\d+)\].*?"
+            rb"BT /F1 (?P<font_size>\d+) Tf (?P<text_x>\d+) (?P<text_y>\d+) Td "
+            rb"\((?P<token>[A-Z]+)\) Tj ET",
+            payload,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(layout, "unexpected functional-probe PDF layout")
+        values = {
+            name: int(value)
+            for name, value in layout.groupdict().items()
+            if name != "token"
+        }
+        # Every uppercase Helvetica glyph is narrower than one em, so this is
+        # a deliberately conservative bound that leaves room for extraction.
+        required_width = values["font_size"] * len(layout.group("token"))
+        available_width = values["page_width"] - values["text_x"]
+        self.assertGreaterEqual(available_width, required_width)
+
     def test_posix_pdf_without_resource_limits_fails_closed(self):
         with mock.patch.object(build_index.os, "name", "posix"), \
                 mock.patch.object(build_index, "resource", None), \
